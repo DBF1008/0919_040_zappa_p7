@@ -41,7 +41,8 @@ from click.globals import push_context
 from dateutil import parser
 from datetime import datetime, timedelta
 
-from .core import Zappa, logger, API_GATEWAY_REGIONS
+from .core import Zappa, logger
+from .config import get_api_gateway_regions
 from .utilities import (check_new_version_available, detect_django_settings,
                   detect_flask_apps, parse_s3_url, human_size,
                   validate_name, InvalidAwsLambdaName, get_venv_from_python_version,
@@ -122,35 +123,68 @@ class ZappaCLI:
 
     def __init__(self):
         self._stage_config_overrides = {}  # change using self.override_stage_config_setting(key, val)
+        # Cache of the resolved (extends merged) settings keyed by stage name.
+        # Invalidated whenever the settings file is (re)loaded.
+        self._stage_settings_cache = {}
+
+    def _invalidate_stage_settings_cache(self):
+        """
+        Drop the resolved stage settings cache. Must be called whenever
+        ``self.zappa_settings`` is replaced or mutated.
+        """
+        self._stage_settings_cache = {}
+
+    def _resolve_stage_setting(self, stage, extended_stages=None):
+        """
+        Resolve the settings for a single stage, recursively merging in any
+        stage referenced by its ``extends`` key.
+
+        The merged result is cached on the ZappaCLI instance so that the many
+        ``stage_config`` accesses during a deploy/update do not re-parse and
+        re-merge the same settings over and over again.
+        """
+        is_top_level = extended_stages is None
+        if is_top_level:
+            # Top level call: return the cached value when available.
+            cached = self._stage_settings_cache.get(stage)
+            if cached is not None:
+                return cached
+            extended_stages = []
+
+        if stage in extended_stages:
+            raise RuntimeError(stage + " has already been extended to these settings. "
+                                       "There is a circular extends within the settings file.")
+        extended_stages.append(stage)
+
+        try:
+            stage_settings = dict(self.zappa_settings[stage].copy())
+        except KeyError:
+            raise ClickException("Cannot extend settings for undefined stage '" + stage + "'.")
+
+        extends_stage = self.zappa_settings[stage].get('extends', None)
+        if extends_stage:
+            extended_settings = self._resolve_stage_setting(
+                stage=extends_stage, extended_stages=extended_stages
+            )
+            extended_settings.update(stage_settings)
+            stage_settings = extended_settings
+
+        if is_top_level:
+            # Cache the final, fully merged settings of the initially
+            # requested stage.
+            self._stage_settings_cache[stage] = stage_settings
+        return stage_settings
 
     @property
     def stage_config(self):
         """
         A shortcut property for settings of a stage.
+
+        The extends-merged stage settings are cached; only the override and
+        backwards-compat layers are applied on each access.
         """
-
-        def get_stage_setting(stage, extended_stages=None):
-            if extended_stages is None:
-                extended_stages = []
-
-            if stage in extended_stages:
-                raise RuntimeError(stage + " has already been extended to these settings. "
-                                           "There is a circular extends within the settings file.")
-            extended_stages.append(stage)
-
-            try:
-                stage_settings = dict(self.zappa_settings[stage].copy())
-            except KeyError:
-                raise ClickException("Cannot extend settings for undefined stage '" + stage + "'.")
-
-            extends_stage = self.zappa_settings[stage].get('extends', None)
-            if not extends_stage:
-                return stage_settings
-            extended_settings = get_stage_setting(stage=extends_stage, extended_stages=extended_stages)
-            extended_settings.update(stage_settings)
-            return extended_settings
-
-        settings = get_stage_setting(stage=self.api_stage)
+        # Copy so callers mutating the returned dict cannot poison the cache.
+        settings = dict(self._resolve_stage_setting(stage=self.api_stage))
 
         # Backwards compatible for delete_zip setting that was more explicitly named delete_local_zip
         if 'delete_zip' in settings:
@@ -179,12 +213,24 @@ class ZappaCLI:
 
     def handle(self, argv=None):
         """
-        Main function.
+        Main entry point.
 
-        Parses command, load settings and dispatches accordingly.
-
+        Builds the argument parser, parses the command line and runs the
+        requested command. Subcommand argparse definitions live in their own
+        ``_add_<command>_parser`` methods; post-parse handling lives in
+        :meth:`_process_args`.
         """
+        parser = self.build_parser()
+        args = parser.parse_args(argv)
+        self._process_args(args, parser)
 
+    def build_parser(self):
+        """
+        Construct the top-level argparse parser and register every
+        subcommand. Each subcommand's arguments are defined in its own
+        ``_add_<command>_parser`` helper so that new commands can be added
+        without touching a single monolithic method.
+        """
         desc = ('Zappa - Deploy Python applications to AWS Lambda'
                 ' and API Gateway.\n')
         parser = argparse.ArgumentParser(description=desc)
@@ -197,6 +243,41 @@ class ZappaCLI:
             '--color', default='auto', choices=['auto','never','always']
         )
 
+        env_parser = self._build_env_parser()
+
+        subparsers = parser.add_subparsers(title='subcommands', dest='command')
+        self._add_certify_parser(subparsers, env_parser)
+        self._add_deploy_parser(subparsers, env_parser)
+        self._add_init_parser(subparsers)
+        self._add_package_parser(subparsers, env_parser)
+        self._add_template_parser(subparsers, env_parser)
+        self._add_invoke_parser(subparsers, env_parser)
+        self._add_manage_parser(subparsers)
+        self._add_rollback_parser(subparsers, env_parser)
+        self._add_schedule_parser(subparsers, env_parser)
+        self._add_status_parser(subparsers, env_parser)
+        self._add_tail_parser(subparsers, env_parser)
+        self._add_undeploy_parser(subparsers, env_parser)
+        self._add_unschedule_parser(subparsers, env_parser)
+        self._add_update_parser(subparsers, env_parser)
+        self._add_shell_parser(subparsers, env_parser)
+
+        argcomplete.autocomplete(parser)
+        return parser
+
+    @staticmethod
+    def _positive_int(s):
+        """ Ensure an arg is positive """
+        i = int(s)
+        if i < 0:
+            msg = "This argument must be positive (got {})".format(s)
+            raise argparse.ArgumentTypeError(msg)
+        return i
+
+    def _build_env_parser(self):
+        """
+        Arguments shared by every subcommand that operates on a stage.
+        """
         env_parser = argparse.ArgumentParser(add_help=False)
         me_group = env_parser.add_mutually_exclusive_group()
         all_help = ('Execute this command for all of our defined '
@@ -227,11 +308,10 @@ class ZappaCLI:
         group.add_argument(
             "--no_venv", action="store_true", help="Skip venv check."
         )
+        return env_parser
 
-        ##
-        # Certify
-        ##
-        subparsers = parser.add_subparsers(title='subcommands', dest='command')
+    def _add_certify_parser(self, subparsers, env_parser):
+        """ Create and install SSL certificate """
         cert_parser = subparsers.add_parser(
             'certify', parents=[env_parser],
             help='Create and install SSL certificate'
@@ -245,9 +325,8 @@ class ZappaCLI:
             '-y', '--yes', action='store_true', help='Auto confirm yes.'
         )
 
-        ##
-        # Deploy
-        ##
+    def _add_deploy_parser(self, subparsers, env_parser):
+        """ Deploy application. """
         deploy_parser = subparsers.add_parser(
             'deploy', parents=[env_parser], help='Deploy application.'
         )
@@ -255,14 +334,12 @@ class ZappaCLI:
             '-z', '--zip', help='Deploy Lambda with specific local or S3 hosted zip package'
         )
 
-        ##
-        # Init
-        ##
-        init_parser = subparsers.add_parser('init', help='Initialize Zappa app.')
+    def _add_init_parser(self, subparsers):
+        """ Initialize Zappa app. """
+        subparsers.add_parser('init', help='Initialize Zappa app.')
 
-        ##
-        # Package
-        ##
+    def _add_package_parser(self, subparsers, env_parser):
+        """ Build the application zip package locally. """
         package_parser = subparsers.add_parser(
             'package', parents=[env_parser], help='Build the application zip package locally.'
         )
@@ -270,9 +347,8 @@ class ZappaCLI:
             '-o', '--output', help='Name of file to output the package to.'
         )
 
-        ##
-        # Template
-        ##
+    def _add_template_parser(self, subparsers, env_parser):
+        """ Create a CloudFormation template for this API Gateway. """
         template_parser = subparsers.add_parser(
             'template', parents=[env_parser], help='Create a CloudFormation template for this API Gateway.'
         )
@@ -286,9 +362,8 @@ class ZappaCLI:
             '-o', '--output', help='Name of file to output the template to.'
         )
 
-        ##
-        # Invocation
-        ##
+    def _add_invoke_parser(self, subparsers, env_parser):
+        """ Invoke remote function. """
         invoke_parser = subparsers.add_parser(
             'invoke', parents=[env_parser],
             help='Invoke remote function.'
@@ -304,13 +379,14 @@ class ZappaCLI:
         )
         invoke_parser.add_argument('command_rest')
 
-        ##
-        # Manage
-        ##
+    def _add_manage_parser(self, subparsers):
+        """ Invoke remote Django manage.py commands. """
         manage_parser = subparsers.add_parser(
             'manage',
             help='Invoke remote Django manage.py commands.'
         )
+        all_help = ('Execute this command for all of our defined '
+                    'Zappa stages.')
         rest_help = ("Command in the form of <env> <command>. <env> is not "
                      "required if --all is specified")
         manage_parser.add_argument('--all', action='store_true', help=all_help)
@@ -325,45 +401,33 @@ class ZappaCLI:
             '-s', '--settings_file', help='The path to a Zappa settings file.'
         )
 
-        ##
-        # Rollback
-        ##
-        def positive_int(s):
-            """ Ensure an arg is positive """
-            i = int(s)
-            if i < 0:
-                msg = "This argument must be positive (got {})".format(s)
-                raise argparse.ArgumentTypeError(msg)
-            return i
-
+    def _add_rollback_parser(self, subparsers, env_parser):
+        """ Rollback deployed code to a previous version. """
         rollback_parser = subparsers.add_parser(
             'rollback', parents=[env_parser],
             help='Rollback deployed code to a previous version.'
         )
         rollback_parser.add_argument(
-            '-n', '--num-rollback', type=positive_int, default=1,
+            '-n', '--num-rollback', type=self._positive_int, default=1,
             help='The number of versions to rollback.'
         )
 
-        ##
-        # Scheduling
-        ##
+    def _add_schedule_parser(self, subparsers, env_parser):
+        """ Schedule functions to occur at regular intervals. """
         subparsers.add_parser(
             'schedule', parents=[env_parser],
             help='Schedule functions to occur at regular intervals.'
         )
 
-        ##
-        # Status
-        ##
+    def _add_status_parser(self, subparsers, env_parser):
+        """ Show deployment status and event schedules. """
         subparsers.add_parser(
             'status', parents=[env_parser],
             help='Show deployment status and event schedules.'
         )
 
-        ##
-        # Log Tailing
-        ##
+    def _add_tail_parser(self, subparsers, env_parser):
+        """ Tail deployment logs. """
         tail_parser = subparsers.add_parser(
             'tail', parents=[env_parser], help='Tail deployment logs.'
         )
@@ -396,9 +460,8 @@ class ZappaCLI:
             help="Exit after printing the last available log, rather than keeping the log open."
         )
 
-        ##
-        # Undeploy
-        ##
+    def _add_undeploy_parser(self, subparsers, env_parser):
+        """ Undeploy application. """
         undeploy_parser = subparsers.add_parser(
             'undeploy', parents=[env_parser], help='Undeploy application.'
         )
@@ -411,15 +474,13 @@ class ZappaCLI:
             '-y', '--yes', action='store_true', help='Auto confirm yes.'
         )
 
-        ##
-        # Unschedule
-        ##
+    def _add_unschedule_parser(self, subparsers, env_parser):
+        """ Unschedule functions. """
         subparsers.add_parser('unschedule', parents=[env_parser],
                               help='Unschedule functions.')
 
-        ##
-        # Updating
-        ##
+    def _add_update_parser(self, subparsers, env_parser):
+        """ Update deployed application. """
         update_parser = subparsers.add_parser(
             'update', parents=[env_parser], help='Update deployed application.'
         )
@@ -430,15 +491,17 @@ class ZappaCLI:
             '-n', '--no-upload', help="Update configuration where appropriate, but don't upload new code"
         )
 
-        ##
-        # Debug
-        ##
+    def _add_shell_parser(self, subparsers, env_parser):
+        """ A debug shell with a loaded Zappa object. """
         subparsers.add_parser(
             'shell', parents=[env_parser], help='A debug shell with a loaded Zappa object.'
         )
 
-        argcomplete.autocomplete(parser)
-        args = parser.parse_args(argv)
+    def _process_args(self, args, parser):
+        """
+        Apply the parsed arguments: configure output, load settings and
+        dispatch the command for each targeted stage.
+        """
         self.vargs = vars(args)
 
         if args.color == 'never':
@@ -514,6 +577,7 @@ class ZappaCLI:
                 # Discussion on exit codes: https://github.com/Miserlou/Zappa/issues/407
                 e.show()
                 sys.exit(e.exit_code)
+
 
     def dispatch_command(self, command, stage):
         """
@@ -1753,7 +1817,7 @@ class ZappaCLI:
 
         # Global Region Deployment
         if global_deployment:
-            additional_regions = [r for r in API_GATEWAY_REGIONS if r != profile_region]
+            additional_regions = [r for r in get_api_gateway_regions() if r != profile_region]
             # Create additional stages
             if global_type.lower() in ["p", "primary"]:
                 additional_regions = [r for r in additional_regions if '-1' in r]
@@ -2200,6 +2264,10 @@ class ZappaCLI:
                     self.zappa_settings = json.load(json_file)
                 except ValueError: # pragma: no cover
                     raise ValueError("Unable to load the Zappa settings JSON. It may be malformed.")
+
+        # The raw settings changed, so any previously resolved/cached stage
+        # settings must be rebuilt on the next ``stage_config`` access.
+        self._invalidate_stage_settings_cache()
 
     def create_package(self, output=None):
         """

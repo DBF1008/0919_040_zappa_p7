@@ -35,6 +35,8 @@ import troposphere.apigateway
 from botocore.exceptions import ClientError
 from tqdm import tqdm
 
+from .config import (get_api_gateway_regions, get_lambda_regions,
+                     get_zip_excludes)
 from .utilities import (add_event_source, conflicts_with_a_neighbouring_module,
                         contains_python_files_or_subdirs, copytree,
                         get_topic_name, get_venv_from_python_version,
@@ -159,48 +161,22 @@ ATTACH_POLICY = """{
     ]
 }"""
 
-# Latest list: https://docs.aws.amazon.com/general/latest/gr/rande.html#apigateway_region
-API_GATEWAY_REGIONS = ['us-east-1', 'us-east-2',
-                       'us-west-1', 'us-west-2',
-                       'eu-central-1',
-                       'eu-north-1',
-                       'eu-west-1', 'eu-west-2', 'eu-west-3',
-                       'eu-north-1',
-                       'ap-northeast-1', 'ap-northeast-2', 'ap-northeast-3',
-                       'ap-southeast-1', 'ap-southeast-2',
-                       'ap-east-1',
-                       'ap-south-1',
-                       'ca-central-1',
-                       'cn-north-1',
-                       'cn-northwest-1',
-                       'sa-east-1',
-                       'us-gov-east-1', 'us-gov-west-1']
-
-# Latest list: https://docs.aws.amazon.com/general/latest/gr/rande.html#lambda_region
-LAMBDA_REGIONS = ['us-east-1', 'us-east-2',
-                  'us-west-1', 'us-west-2',
-                  'eu-central-1',
-                  'eu-north-1',
-                  'eu-west-1', 'eu-west-2', 'eu-west-3',
-                  'eu-north-1',
-                  'ap-northeast-1', 'ap-northeast-2', 'ap-northeast-3',
-                  'ap-southeast-1', 'ap-southeast-2',
-                  'ap-east-1',
-                  'ap-south-1',
-                  'ca-central-1',
-                  'cn-north-1',
-                  'cn-northwest-1',
-                  'sa-east-1',
-                  'us-gov-east-1',
-                  'us-gov-west-1']
+# These values are no longer hardcoded. They are resolved at runtime from
+# the shipped defaults in ``zappa/zappa_config.json``, optional custom config
+# files / environment variables and (for regions) botocore endpoint metadata.
+# See ``zappa/config.py`` for details.
+#
+# The module-level lists are kept as the shipped defaults for backwards
+# compatibility with code that imports them directly; prefer the getter
+# functions (``get_*_regions`` / ``get_zip_excludes``) so newly added AWS
+# regions and config overrides are actually picked up.
+API_GATEWAY_REGIONS = get_api_gateway_regions()
+LAMBDA_REGIONS = get_lambda_regions()
 
 # We never need to include these.
 # Related: https://github.com/Miserlou/Zappa/pull/56
 # Related: https://github.com/Miserlou/Zappa/pull/581
-ZIP_EXCLUDES = [
-    '*.exe', '*.DS_Store', '*.Python', '*.git', '.git/*', '*.zip', '*.tar.gz',
-    '*.hg', 'pip', 'docutils*', 'setuputils*', '__pycache__/*'
-]
+ZIP_EXCLUDES = get_zip_excludes()
 
 # When using ALB as an event source for Lambdas, we need to create an alias
 # to ensure that, on zappa update, the ALB doesn't lose permissions to access
@@ -549,7 +525,7 @@ class Zappa:
             # Slim handler does not take the project files.
             if minify:
                 # Related: https://github.com/Miserlou/Zappa/issues/744
-                excludes = ZIP_EXCLUDES + exclude + [split_venv[-1]]
+                excludes = get_zip_excludes() + exclude + [split_venv[-1]]
                 copytree(cwd, temp_project_path, metadata=False, symlinks=False, ignore=shutil.ignore_patterns(*excludes))
             else:
                 copytree(cwd, temp_project_path, metadata=False, symlinks=False)
@@ -623,7 +599,7 @@ class Zappa:
         egg_links.extend(glob.glob(os.path.join(site_packages, '*.egg-link')))
 
         if minify:
-            excludes = ZIP_EXCLUDES + exclude
+            excludes = get_zip_excludes() + exclude
             copytree(site_packages, temp_package_path, metadata=False, symlinks=False, ignore=shutil.ignore_patterns(*excludes))
         else:
             copytree(site_packages, temp_package_path, metadata=False, symlinks=False)
@@ -633,7 +609,7 @@ class Zappa:
         if os.path.exists(site_packages_64):
             egg_links.extend(glob.glob(os.path.join(site_packages_64, '*.egg-link')))
             if minify:
-                excludes = ZIP_EXCLUDES + exclude
+                excludes = get_zip_excludes() + exclude
                 copytree(site_packages_64, temp_package_path, metadata = False, symlinks=False, ignore=shutil.ignore_patterns(*excludes))
             else:
                 copytree(site_packages_64, temp_package_path, metadata = False, symlinks=False)
@@ -3209,10 +3185,10 @@ class Zappa:
         # use provided session's region in case it differs
         self.aws_region = self.boto_session.region_name
 
-        if self.boto_session.region_name not in LAMBDA_REGIONS:
+        if self.boto_session.region_name not in get_lambda_regions():
             print("Warning! AWS Lambda may not be available in this AWS Region!")
 
-        if self.boto_session.region_name not in API_GATEWAY_REGIONS:
+        if self.boto_session.region_name not in get_api_gateway_regions():
             print("Warning! AWS API Gateway may not be available in this AWS Region!")
 
     @staticmethod

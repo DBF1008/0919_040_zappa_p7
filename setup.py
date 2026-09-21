@@ -17,6 +17,7 @@ setup(
     name='zappa',
     version=__version__,
     packages=['zappa'],
+    package_data={'zappa': ['zappa_config.json']},
     install_requires=required,
     tests_require=test_required,
     test_suite='nose.collector',
