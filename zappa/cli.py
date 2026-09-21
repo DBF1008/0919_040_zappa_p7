@@ -41,7 +41,7 @@ from click.globals import push_context
 from dateutil import parser
 from datetime import datetime, timedelta
 
-from .core import Zappa, logger, API_GATEWAY_REGIONS
+from .core import Zappa, logger, get_api_gateway_regions
 from .utilities import (check_new_version_available, detect_django_settings,
                   detect_flask_apps, parse_s3_url, human_size,
                   validate_name, InvalidAwsLambdaName, get_venv_from_python_version,
@@ -64,6 +64,41 @@ CUSTOM_SETTINGS = [
 ]
 
 BOTO3_CONFIG_DOCS_URL = 'https://boto3.readthedocs.io/en/latest/guide/quickstart.html#configuration'
+
+ALL_STAGES_HELP = 'Execute this command for all of our defined Zappa stages.'
+
+# All Zappa subcommands in help/registration order.
+# Adding a new command means adding an entry here, a
+# ``_add_<name>_parser`` builder and a ``_run_<name>`` handler.
+SUBCOMMANDS = (
+    ('certify', 'Create and install SSL certificate'),
+    ('deploy', 'Deploy application.'),
+    ('init', 'Initialize Zappa app.'),
+    ('package', 'Build the application zip package locally.'),
+    ('template', 'Create a CloudFormation template for this API Gateway.'),
+    ('invoke', 'Invoke remote function.'),
+    ('manage', 'Invoke remote Django manage.py commands.'),
+    ('rollback', 'Rollback deployed code to a previous version.'),
+    ('schedule', 'Schedule functions to occur at regular intervals.'),
+    ('status', 'Show deployment status and event schedules.'),
+    ('tail', 'Tail deployment logs.'),
+    ('undeploy', 'Undeploy application.'),
+    ('unschedule', 'Unschedule functions.'),
+    ('update', 'Update deployed application.'),
+    ('shell', 'A debug shell with a loaded Zappa object.'),
+)
+
+
+def positive_int(value):
+    """
+    Argparse type for arguments that have to be positive integers.
+    """
+    integer = int(value)
+    if integer < 0:
+        msg = "This argument must be positive (got {})".format(value)
+        raise argparse.ArgumentTypeError(msg)
+    return integer
+
 
 ##
 # Main Input Processing
@@ -122,43 +157,73 @@ class ZappaCLI:
 
     def __init__(self):
         self._stage_config_overrides = {}  # change using self.override_stage_config_setting(key, val)
+        self._stage_config_cache = {}
 
     @property
     def stage_config(self):
         """
         A shortcut property for settings of a stage.
+
+        The result of merging the ``extends`` chain is cached per stage, so
+        repeatedly accessing this property during a deployment does not
+        re-parse and re-merge the settings every time. The cache is reset when
+        a new settings file is loaded (:meth:`load_settings_file`) or when a
+        setting is forcefully overridden
+        (:meth:`override_stage_config_setting`).
         """
-
-        def get_stage_setting(stage, extended_stages=None):
-            if extended_stages is None:
-                extended_stages = []
-
-            if stage in extended_stages:
-                raise RuntimeError(stage + " has already been extended to these settings. "
-                                           "There is a circular extends within the settings file.")
-            extended_stages.append(stage)
-
-            try:
-                stage_settings = dict(self.zappa_settings[stage].copy())
-            except KeyError:
-                raise ClickException("Cannot extend settings for undefined stage '" + stage + "'.")
-
-            extends_stage = self.zappa_settings[stage].get('extends', None)
-            if not extends_stage:
-                return stage_settings
-            extended_settings = get_stage_setting(stage=extends_stage, extended_stages=extended_stages)
-            extended_settings.update(stage_settings)
-            return extended_settings
-
-        settings = get_stage_setting(stage=self.api_stage)
-
-        # Backwards compatible for delete_zip setting that was more explicitly named delete_local_zip
-        if 'delete_zip' in settings:
-            settings['delete_local_zip'] = settings.get('delete_zip')
-
+        settings = dict(self._get_cached_stage_settings(self.api_stage))
         settings.update(self.stage_config_overrides)
-
         return settings
+
+    def _resolve_stage_settings(self, stage, extended_stages=None):
+        """
+        Recursively merge a stage with any stage it ``extends``.
+
+        Raises a ``RuntimeError`` on circular extends and a ``ClickException``
+        when an extended stage is not defined.
+        """
+        if extended_stages is None:
+            extended_stages = []
+
+        if stage in extended_stages:
+            raise RuntimeError(stage + " has already been extended to these settings. "
+                                       "There is a circular extends within the settings file.")
+        extended_stages.append(stage)
+
+        try:
+            stage_settings = dict(self.zappa_settings[stage])
+        except KeyError:
+            raise ClickException("Cannot extend settings for undefined stage '" + stage + "'.")
+
+        extends_stage = stage_settings.get('extends', None)
+        if not extends_stage:
+            resolved = stage_settings
+        else:
+            resolved = self._resolve_stage_settings(
+                stage=extends_stage, extended_stages=extended_stages
+            )
+            resolved.update(stage_settings)
+
+        # Backwards compatible for delete_zip setting that was more
+        # explicitly named delete_local_zip
+        if 'delete_zip' in resolved:
+            resolved['delete_local_zip'] = resolved.get('delete_zip')
+
+        return resolved
+
+    def _get_cached_stage_settings(self, stage):
+        """
+        Return the merged settings for a stage, memoized per stage.
+        """
+        if stage not in self._stage_config_cache:
+            self._stage_config_cache[stage] = self._resolve_stage_settings(stage)
+        return self._stage_config_cache[stage]
+
+    def invalidate_stage_config_cache(self):
+        """
+        Drop all memoized stage settings.
+        """
+        self._stage_config_cache = {}
 
     @property
     def stage_config_overrides(self):
@@ -177,14 +242,14 @@ class ZappaCLI:
         self._stage_config_overrides = getattr(self, '_stage_config_overrides', {})
         self._stage_config_overrides.setdefault(self.api_stage, {})[key] = val
 
-    def handle(self, argv=None):
+    ##
+    # Argument parsing
+    ##
+
+    def _create_parser(self):
         """
-        Main function.
-
-        Parses command, load settings and dispatches accordingly.
-
+        Build the top-level argument parser and register all subcommands.
         """
-
         desc = ('Zappa - Deploy Python applications to AWS Lambda'
                 ' and API Gateway.\n')
         parser = argparse.ArgumentParser(description=desc)
@@ -194,14 +259,24 @@ class ZappaCLI:
             help='Print the zappa version'
         )
         parser.add_argument(
-            '--color', default='auto', choices=['auto','never','always']
+            '--color', default='auto', choices=['auto', 'never', 'always']
         )
 
+        subparsers = parser.add_subparsers(title='subcommands', dest='command')
+        for command, help_text in SUBCOMMANDS:
+            builder = getattr(self, '_add_' + command + '_parser')
+            builder(subparsers, help_text)
+
+        argcomplete.autocomplete(parser)
+        return parser
+
+    def _add_env_parser(self):
+        """
+        Common arguments inherited by every stage-aware subcommand.
+        """
         env_parser = argparse.ArgumentParser(add_help=False)
         me_group = env_parser.add_mutually_exclusive_group()
-        all_help = ('Execute this command for all of our defined '
-                    'Zappa stages.')
-        me_group.add_argument('--all', action='store_true', help=all_help)
+        me_group.add_argument('--all', action='store_true', help=ALL_STAGES_HELP)
         me_group.add_argument('stage_env', nargs='?')
 
         group = env_parser.add_argument_group()
@@ -218,7 +293,8 @@ class ZappaCLI:
         # Moved when 'template' command added.
         # Fuck Terraform.
         group.add_argument(
-            '-j', '--json', action='store_true', help='Make the output of this command be machine readable.'
+            '-j', '--json', action='store_true',
+            help='Make the output of this command be machine readable.'
         )
         # https://github.com/Miserlou/Zappa/issues/891
         group.add_argument(
@@ -227,71 +303,60 @@ class ZappaCLI:
         group.add_argument(
             "--no_venv", action="store_true", help="Skip venv check."
         )
+        return env_parser
 
-        ##
-        # Certify
-        ##
-        subparsers = parser.add_subparsers(title='subcommands', dest='command')
+    def _add_certify_parser(self, subparsers, help_text):
         cert_parser = subparsers.add_parser(
-            'certify', parents=[env_parser],
-            help='Create and install SSL certificate'
+            'certify', parents=[self._add_env_parser()], help=help_text
         )
         cert_parser.add_argument(
             '--manual', action='store_true',
             help=("Gets new Let's Encrypt certificates, but prints them to console."
-                "Does not update API Gateway domains.")
+                  "Does not update API Gateway domains.")
         )
         cert_parser.add_argument(
             '-y', '--yes', action='store_true', help='Auto confirm yes.'
         )
 
-        ##
-        # Deploy
-        ##
+    def _add_deploy_parser(self, subparsers, help_text):
         deploy_parser = subparsers.add_parser(
-            'deploy', parents=[env_parser], help='Deploy application.'
+            'deploy', parents=[self._add_env_parser()], help=help_text
         )
         deploy_parser.add_argument(
-            '-z', '--zip', help='Deploy Lambda with specific local or S3 hosted zip package'
+            '-z', '--zip',
+            help='Deploy Lambda with specific local or S3 hosted zip package'
         )
 
-        ##
-        # Init
-        ##
-        init_parser = subparsers.add_parser('init', help='Initialize Zappa app.')
+    def _add_init_parser(self, subparsers, help_text):
+        subparsers.add_parser('init', help=help_text)
 
-        ##
-        # Package
-        ##
+    def _add_package_parser(self, subparsers, help_text):
         package_parser = subparsers.add_parser(
-            'package', parents=[env_parser], help='Build the application zip package locally.'
+            'package', parents=[self._add_env_parser()], help=help_text
         )
         package_parser.add_argument(
             '-o', '--output', help='Name of file to output the package to.'
         )
 
-        ##
-        # Template
-        ##
+    def _add_template_parser(self, subparsers, help_text):
         template_parser = subparsers.add_parser(
-            'template', parents=[env_parser], help='Create a CloudFormation template for this API Gateway.'
+            'template', parents=[self._add_env_parser()], help=help_text
         )
         template_parser.add_argument(
-            '-l', '--lambda-arn', required=True, help='ARN of the Lambda function to template to.'
+            '-l', '--lambda-arn', required=True,
+            help='ARN of the Lambda function to template to.'
         )
         template_parser.add_argument(
-            '-r', '--role-arn', required=True, help='ARN of the Role to template with.'
+            '-r', '--role-arn', required=True,
+            help='ARN of the Role to template with.'
         )
         template_parser.add_argument(
             '-o', '--output', help='Name of file to output the template to.'
         )
 
-        ##
-        # Invocation
-        ##
+    def _add_invoke_parser(self, subparsers, help_text):
         invoke_parser = subparsers.add_parser(
-            'invoke', parents=[env_parser],
-            help='Invoke remote function.'
+            'invoke', parents=[self._add_env_parser()], help=help_text
         )
         invoke_parser.add_argument(
             '--raw', action='store_true',
@@ -304,68 +369,44 @@ class ZappaCLI:
         )
         invoke_parser.add_argument('command_rest')
 
-        ##
-        # Manage
-        ##
-        manage_parser = subparsers.add_parser(
-            'manage',
-            help='Invoke remote Django manage.py commands.'
-        )
+    def _add_manage_parser(self, subparsers, help_text):
         rest_help = ("Command in the form of <env> <command>. <env> is not "
                      "required if --all is specified")
-        manage_parser.add_argument('--all', action='store_true', help=all_help)
+        # This is the only subcommand that doesn't inherit from env_parser
+        # https://github.com/Miserlou/Zappa/issues/1002
+        manage_parser = subparsers.add_parser('manage', help=help_text)
+        manage_parser.add_argument('--all', action='store_true', help=ALL_STAGES_HELP)
         manage_parser.add_argument('command_rest', nargs='+', help=rest_help)
         manage_parser.add_argument(
             '--no-color', action='store_true',
             help=("Don't color the output")
         )
-        # This is explicitly added here because this is the only subcommand that doesn't inherit from env_parser
-        # https://github.com/Miserlou/Zappa/issues/1002
         manage_parser.add_argument(
             '-s', '--settings_file', help='The path to a Zappa settings file.'
         )
 
-        ##
-        # Rollback
-        ##
-        def positive_int(s):
-            """ Ensure an arg is positive """
-            i = int(s)
-            if i < 0:
-                msg = "This argument must be positive (got {})".format(s)
-                raise argparse.ArgumentTypeError(msg)
-            return i
-
+    def _add_rollback_parser(self, subparsers, help_text):
         rollback_parser = subparsers.add_parser(
-            'rollback', parents=[env_parser],
-            help='Rollback deployed code to a previous version.'
+            'rollback', parents=[self._add_env_parser()], help=help_text
         )
         rollback_parser.add_argument(
             '-n', '--num-rollback', type=positive_int, default=1,
             help='The number of versions to rollback.'
         )
 
-        ##
-        # Scheduling
-        ##
+    def _add_schedule_parser(self, subparsers, help_text):
         subparsers.add_parser(
-            'schedule', parents=[env_parser],
-            help='Schedule functions to occur at regular intervals.'
+            'schedule', parents=[self._add_env_parser()], help=help_text
         )
 
-        ##
-        # Status
-        ##
+    def _add_status_parser(self, subparsers, help_text):
         subparsers.add_parser(
-            'status', parents=[env_parser],
-            help='Show deployment status and event schedules.'
+            'status', parents=[self._add_env_parser()], help=help_text
         )
 
-        ##
-        # Log Tailing
-        ##
+    def _add_tail_parser(self, subparsers, help_text):
         tail_parser = subparsers.add_parser(
-            'tail', parents=[env_parser], help='Tail deployment logs.'
+            'tail', parents=[self._add_env_parser()], help=help_text
         )
         tail_parser.add_argument(
             '--no-color', action='store_true',
@@ -389,18 +430,18 @@ class ZappaCLI:
         )
         tail_parser.add_argument(
             '--force-color', action='store_true',
-            help='Force coloring log tail output even if coloring support is not auto-detected. (example: piping)'
+            help=('Force coloring log tail output even if coloring support '
+                  'is not auto-detected. (example: piping)')
         )
         tail_parser.add_argument(
             '--disable-keep-open', action='store_true',
-            help="Exit after printing the last available log, rather than keeping the log open."
+            help=("Exit after printing the last available log, "
+                  "rather than keeping the log open.")
         )
 
-        ##
-        # Undeploy
-        ##
+    def _add_undeploy_parser(self, subparsers, help_text):
         undeploy_parser = subparsers.add_parser(
-            'undeploy', parents=[env_parser], help='Undeploy application.'
+            'undeploy', parents=[self._add_env_parser()], help=help_text
         )
         undeploy_parser.add_argument(
             '--remove-logs', action='store_true',
@@ -411,70 +452,48 @@ class ZappaCLI:
             '-y', '--yes', action='store_true', help='Auto confirm yes.'
         )
 
-        ##
-        # Unschedule
-        ##
-        subparsers.add_parser('unschedule', parents=[env_parser],
-                              help='Unschedule functions.')
-
-        ##
-        # Updating
-        ##
-        update_parser = subparsers.add_parser(
-            'update', parents=[env_parser], help='Update deployed application.'
-        )
-        update_parser.add_argument(
-            '-z', '--zip', help='Update Lambda with specific local or S3 hosted zip package'
-        )
-        update_parser.add_argument(
-            '-n', '--no-upload', help="Update configuration where appropriate, but don't upload new code"
-        )
-
-        ##
-        # Debug
-        ##
+    def _add_unschedule_parser(self, subparsers, help_text):
         subparsers.add_parser(
-            'shell', parents=[env_parser], help='A debug shell with a loaded Zappa object.'
+            'unschedule', parents=[self._add_env_parser()], help=help_text
         )
 
-        argcomplete.autocomplete(parser)
+    def _add_update_parser(self, subparsers, help_text):
+        update_parser = subparsers.add_parser(
+            'update', parents=[self._add_env_parser()], help=help_text
+        )
+        update_parser.add_argument(
+            '-z', '--zip',
+            help='Update Lambda with specific local or S3 hosted zip package'
+        )
+        update_parser.add_argument(
+            '-n', '--no-upload',
+            help="Update configuration where appropriate, but don't upload new code"
+        )
+
+    def _add_shell_parser(self, subparsers, help_text):
+        subparsers.add_parser(
+            'shell', parents=[self._add_env_parser()], help=help_text
+        )
+
+    def handle(self, argv=None):
+        """
+        Main function.
+
+        Parses command, load settings and dispatches accordingly.
+
+        """
+
+        parser = self._create_parser()
         args = parser.parse_args(argv)
         self.vargs = vars(args)
 
-        if args.color == 'never':
-            disable_click_colors()
-        elif args.color == 'always':
-            #TODO: Support aggressive coloring like "--force-color" on all commands
-            pass
-        elif args.color == 'auto':
-            pass
-
-        # Parse the input
-        # NOTE(rmoe): Special case for manage command
-        # The manage command can't have both stage_env and command_rest
-        # arguments. Since they are both positional arguments argparse can't
-        # differentiate the two. This causes problems when used with --all.
-        # (e.g. "manage --all showmigrations admin" argparse thinks --all has
-        # been specified AND that stage_env='showmigrations')
-        # By having command_rest collect everything but --all we can split it
-        # apart here instead of relying on argparse.
         if not args.command:
             parser.print_help()
             return
 
-        if args.command == 'manage' and not self.vargs.get('all'):
-            self.stage_env = self.vargs['command_rest'].pop(0)
-        else:
-            self.stage_env = self.vargs.get('stage_env')
-
-        if args.command == 'package':
-            self.load_credentials = False
-
         self.command = args.command
-
-        self.disable_progress = self.vargs.get('disable_progress')
-        if self.vargs.get('quiet'):
-            self.silence()
+        self._resolve_stage_env()
+        self._configure_output()
 
         # We don't have any settings yet, so make those first!
         # (Settings-based interactions will fail
@@ -491,29 +510,67 @@ class ZappaCLI:
         self.load_settings_file(self.vargs.get('settings_file'))
 
         # Should we execute this for all stages, or just one?
-        all_stages = self.vargs.get('all')
-        stages = []
-
-        if all_stages: # All stages!
-            stages = self.zappa_settings.keys()
-        else: # Just one env.
-            if not self.stage_env:
-                # If there's only one stage defined in the settings,
-                # use that as the default.
-                if len(self.zappa_settings.keys()) == 1:
-                    stages.append(list(self.zappa_settings.keys())[0])
-                else:
-                    parser.error("Please supply a stage to interact with.")
-            else:
-                stages.append(self.stage_env)
-
-        for stage in stages:
+        for stage in self._resolve_stages(parser):
             try:
                 self.dispatch_command(self.command, stage)
             except ClickException as e:
                 # Discussion on exit codes: https://github.com/Miserlou/Zappa/issues/407
                 e.show()
                 sys.exit(e.exit_code)
+
+    def _resolve_stage_env(self):
+        """
+        Determine the stage(s) targeted by the parsed arguments.
+
+        NOTE(rmoe): Special case for manage command.
+        The manage command can't have both stage_env and command_rest
+        arguments. Since they are both positional arguments argparse can't
+        differentiate the two. This causes problems when used with --all.
+        (e.g. "manage --all showmigrations admin" argparse thinks --all has
+        been specified AND that stage_env='showmigrations')
+        By having command_rest collect everything but --all we can split it
+        apart here instead of relying on argparse.
+        """
+        if self.command == 'manage' and not self.vargs.get('all'):
+            self.stage_env = self.vargs['command_rest'].pop(0)
+        else:
+            self.stage_env = self.vargs.get('stage_env')
+
+    def _configure_output(self):
+        """
+        Apply output-related flags from the parsed arguments.
+        """
+        if self.command == 'package':
+            self.load_credentials = False
+
+        self.disable_progress = self.vargs.get('disable_progress')
+        if self.vargs.get('quiet'):
+            self.silence()
+
+        if self.vargs['color'] == 'never':
+            disable_click_colors()
+        elif self.vargs['color'] == 'always':
+            #TODO: Support aggressive coloring like "--force-color" on all commands
+            pass
+        elif self.vargs['color'] == 'auto':
+            pass
+
+    def _resolve_stages(self, parser):
+        """
+        Resolve the list of stages this command should run against.
+        """
+        if self.vargs.get('all'):  # All stages!
+            return list(self.zappa_settings.keys())
+
+        if self.stage_env:  # Just one env.
+            return [self.stage_env]
+
+        # If there's only one stage defined in the settings,
+        # use that as the default.
+        if len(self.zappa_settings.keys()) == 1:
+            return [list(self.zappa_settings.keys())[0]]
+
+        parser.error("Please supply a stage to interact with.")
 
     def dispatch_command(self, command, stage):
         """
@@ -544,83 +601,96 @@ class ZappaCLI:
             sys.exit(-1)
         self.callback('settings')
 
-        # Hand it off
-        if command == 'deploy': # pragma: no cover
-            self.deploy(self.vargs['zip'])
-        if command == 'package': # pragma: no cover
-            self.package(self.vargs['output'])
-        if command == 'template': # pragma: no cover
-            self.template(      self.vargs['lambda_arn'],
-                                self.vargs['role_arn'],
-                                output=self.vargs['output'],
-                                json=self.vargs['json']
-                            )
-        elif command == 'update': # pragma: no cover
-            self.update(self.vargs['zip'], self.vargs['no_upload'])
-        elif command == 'rollback': # pragma: no cover
-            self.rollback(self.vargs['num_rollback'])
-        elif command == 'invoke': # pragma: no cover
+        # Hand it off to the command-specific runner.
+        getattr(self, '_run_' + command)()
 
-            if not self.vargs.get('command_rest'):
-                print("Please enter the function to invoke.")
-                return
+    def _run_deploy(self):
+        self.deploy(self.vargs['zip'])
 
-            self.invoke(
-                self.vargs['command_rest'],
-                raw_python=self.vargs['raw'],
-                no_color=self.vargs['no_color'],
-            )
-        elif command == 'manage': # pragma: no cover
+    def _run_package(self):
+        self.package(self.vargs['output'])
 
-            if not self.vargs.get('command_rest'):
-                print("Please enter the management command to invoke.")
-                return
+    def _run_template(self):
+        self.template(
+            self.vargs['lambda_arn'],
+            self.vargs['role_arn'],
+            output=self.vargs['output'],
+            json=self.vargs['json']
+        )
 
-            if not self.django_settings:
-                print("This command is for Django projects only!")
-                print("If this is a Django project, please define django_settings in your zappa_settings.")
-                return
+    def _run_update(self):
+        self.update(self.vargs['zip'], self.vargs['no_upload'])
 
-            command_tail = self.vargs.get('command_rest')
-            if len(command_tail) > 1:
-                command = " ".join(command_tail) # ex: zappa manage dev "shell --version"
-            else:
-                command = command_tail[0] # ex: zappa manage dev showmigrations admin
+    def _run_rollback(self):
+        self.rollback(self.vargs['num_rollback'])
 
-            self.invoke(
-                command,
-                command="manage",
-                no_color=self.vargs['no_color'],
-            )
+    def _run_invoke(self):
+        if not self.vargs.get('command_rest'):
+            print("Please enter the function to invoke.")
+            return
 
-        elif command == 'tail': # pragma: no cover
-            self.tail(
-                colorize=(not self.vargs['no_color']),
-                http=self.vargs['http'],
-                non_http=self.vargs['non_http'],
-                since=self.vargs['since'],
-                filter_pattern=self.vargs['filter'],
-                force_colorize=self.vargs['force_color'] or None,
-                keep_open=not self.vargs['disable_keep_open']
-            )
-        elif command == 'undeploy': # pragma: no cover
-            self.undeploy(
-                no_confirm=self.vargs['yes'],
-                remove_logs=self.vargs['remove_logs']
-            )
-        elif command == 'schedule': # pragma: no cover
-            self.schedule()
-        elif command == 'unschedule': # pragma: no cover
-            self.unschedule()
-        elif command == 'status': # pragma: no cover
-            self.status(return_json=self.vargs['json'])
-        elif command == 'certify': # pragma: no cover
-            self.certify(
-                no_confirm=self.vargs['yes'],
-                manual=self.vargs['manual']
-            )
-        elif command == 'shell': # pragma: no cover
-            self.shell()
+        self.invoke(
+            self.vargs['command_rest'],
+            raw_python=self.vargs['raw'],
+            no_color=self.vargs['no_color'],
+        )
+
+    def _run_manage(self):
+        if not self.vargs.get('command_rest'):
+            print("Please enter the management command to invoke.")
+            return
+
+        if not self.django_settings:
+            print("This command is for Django projects only!")
+            print("If this is a Django project, please define django_settings in your zappa_settings.")
+            return
+
+        command_tail = self.vargs.get('command_rest')
+        if len(command_tail) > 1:
+            command = " ".join(command_tail)  # ex: zappa manage dev "shell --version"
+        else:
+            command = command_tail[0]  # ex: zappa manage dev showmigrations admin
+
+        self.invoke(
+            command,
+            command="manage",
+            no_color=self.vargs['no_color'],
+        )
+
+    def _run_tail(self):
+        self.tail(
+            colorize=(not self.vargs['no_color']),
+            http=self.vargs['http'],
+            non_http=self.vargs['non_http'],
+            since=self.vargs['since'],
+            filter_pattern=self.vargs['filter'],
+            force_colorize=self.vargs['force_color'] or None,
+            keep_open=not self.vargs['disable_keep_open']
+        )
+
+    def _run_undeploy(self):
+        self.undeploy(
+            no_confirm=self.vargs['yes'],
+            remove_logs=self.vargs['remove_logs']
+        )
+
+    def _run_schedule(self):
+        self.schedule()
+
+    def _run_unschedule(self):
+        self.unschedule()
+
+    def _run_status(self):
+        self.status(return_json=self.vargs['json'])
+
+    def _run_certify(self):
+        self.certify(
+            no_confirm=self.vargs['yes'],
+            manual=self.vargs['manual']
+        )
+
+    def _run_shell(self):
+        self.shell()
 
     ##
     # The Commands
@@ -1753,7 +1823,7 @@ class ZappaCLI:
 
         # Global Region Deployment
         if global_deployment:
-            additional_regions = [r for r in API_GATEWAY_REGIONS if r != profile_region]
+            additional_regions = [r for r in get_api_gateway_regions() if r != profile_region]
             # Create additional stages
             if global_type.lower() in ["p", "primary"]:
                 additional_regions = [r for r in additional_regions if '-1' in r]
@@ -2185,21 +2255,24 @@ class ZappaCLI:
         if ext == '.yml' or ext == '.yaml':
             with open(settings_file) as yaml_file:
                 try:
-                    self.zappa_settings = yaml.safe_load(yaml_file)
+                    loaded_settings = yaml.safe_load(yaml_file)
                 except ValueError: # pragma: no cover
                     raise ValueError("Unable to load the Zappa settings YAML. It may be malformed.")
         elif ext == '.toml':
             with open(settings_file) as toml_file:
                 try:
-                    self.zappa_settings = toml.load(toml_file)
+                    loaded_settings = toml.load(toml_file)
                 except ValueError: # pragma: no cover
                     raise ValueError("Unable to load the Zappa settings TOML. It may be malformed.")
         else:
             with open(settings_file) as json_file:
                 try:
-                    self.zappa_settings = json.load(json_file)
+                    loaded_settings = json.load(json_file)
                 except ValueError: # pragma: no cover
                     raise ValueError("Unable to load the Zappa settings JSON. It may be malformed.")
+
+        self.zappa_settings = loaded_settings
+        self.invalidate_stage_config_cache()
 
     def create_package(self, output=None):
         """

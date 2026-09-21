@@ -159,48 +159,133 @@ ATTACH_POLICY = """{
     ]
 }"""
 
+##
+# Externalized constants
+##
+#
+# Region availability and the default packaging exclusions are no longer
+# hardcoded: they are resolved at runtime, in this order:
+#
+#   1. An environment variable override (comma separated):
+#        ZAPPA_API_GATEWAY_REGIONS / ZAPPA_LAMBDA_REGIONS / ZAPPA_ZIP_EXCLUDES
+#   2. The data bundled with the installed botocore (its endpoints data is
+#      updated whenever botocore is, so newly launched AWS regions work
+#      without a Zappa release).
+#   3. The fallback lists shipped in ``zappa/data/aws_regions.json``.
+#
+# The module-level names below are kept for backwards compatibility with
+# code that imports them directly; runtime callers should prefer the
+# ``get_api_gateway_regions`` / ``get_lambda_regions`` / ``get_zip_excludes``
+# functions which honour overrides and cache the resolved values.
+
+AWS_REGIONS_DATA_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), 'data', 'aws_regions.json'
+)
+
+# Environment variables that force a particular list (comma separated).
+ENV_API_GATEWAY_REGIONS = 'ZAPPA_API_GATEWAY_REGIONS'
+ENV_LAMBDA_REGIONS = 'ZAPPA_LAMBDA_REGIONS'
+ENV_ZIP_EXCLUDES = 'ZAPPA_ZIP_EXCLUDES'
+
+_runtime_constants_cache = {}
+
+
+def _load_fallback_constants():
+    """
+    Load the constants shipped with Zappa as a last-resort fallback.
+    """
+    with open(AWS_REGIONS_DATA_FILE, 'r') as constants_file:
+        data = json.load(constants_file)
+    return {
+        'api_gateway_regions': list(data.get('api_gateway_regions', [])),
+        'lambda_regions': list(data.get('lambda_regions', [])),
+        'zip_excludes': list(data.get('zip_excludes', [])),
+    }
+
+
+def _discover_service_regions(service_name):
+    """
+    Return the regions where ``service_name`` is available, based on the
+    endpoints data bundled with botocore. Returns an empty list if the
+    information cannot be determined.
+    """
+    try:
+        session = botocore.session.Session()
+        available = session.get_available_regions(service_name)
+        return list(available)
+    except Exception as exception:  # pragma: no cover - defensive
+        logger.debug("Could not discover regions for %s: %s",
+                     service_name, exception)
+        return []
+
+
+def _env_override(env_name):
+    """
+    Parse a comma-separated environment variable override, if present.
+    """
+    raw_value = os.environ.get(env_name)
+    if not raw_value:
+        return None
+    return [item.strip() for item in raw_value.split(',') if item.strip()]
+
+
+def _resolve_runtime_constants():
+    """
+    Resolve and memoize the externalized constants.
+    """
+    if _runtime_constants_cache:
+        return _runtime_constants_cache
+
+    fallback = _load_fallback_constants()
+
+    api_gateway_regions = (_env_override(ENV_API_GATEWAY_REGIONS)
+                           or _discover_service_regions('apigateway')
+                           or fallback['api_gateway_regions'])
+    lambda_regions = (_env_override(ENV_LAMBDA_REGIONS)
+                      or _discover_service_regions('lambda')
+                      or fallback['lambda_regions'])
+    zip_excludes = _env_override(ENV_ZIP_EXCLUDES) or fallback['zip_excludes']
+
+    _runtime_constants_cache.update({
+        'api_gateway_regions': api_gateway_regions,
+        'lambda_regions': lambda_regions,
+        'zip_excludes': list(zip_excludes),
+    })
+    return _runtime_constants_cache
+
+
+def get_api_gateway_regions():
+    """
+    Return the regions in which API Gateway is available.
+    """
+    return list(_resolve_runtime_constants()['api_gateway_regions'])
+
+
+def get_lambda_regions():
+    """
+    Return the regions in which AWS Lambda is available.
+    """
+    return list(_resolve_runtime_constants()['lambda_regions'])
+
+
+def get_zip_excludes():
+    """
+    Return the file patterns that are excluded from deployment packages.
+    """
+    return list(_resolve_runtime_constants()['zip_excludes'])
+
+
+# Backwards compatible constant names.
 # Latest list: https://docs.aws.amazon.com/general/latest/gr/rande.html#apigateway_region
-API_GATEWAY_REGIONS = ['us-east-1', 'us-east-2',
-                       'us-west-1', 'us-west-2',
-                       'eu-central-1',
-                       'eu-north-1',
-                       'eu-west-1', 'eu-west-2', 'eu-west-3',
-                       'eu-north-1',
-                       'ap-northeast-1', 'ap-northeast-2', 'ap-northeast-3',
-                       'ap-southeast-1', 'ap-southeast-2',
-                       'ap-east-1',
-                       'ap-south-1',
-                       'ca-central-1',
-                       'cn-north-1',
-                       'cn-northwest-1',
-                       'sa-east-1',
-                       'us-gov-east-1', 'us-gov-west-1']
+API_GATEWAY_REGIONS = get_api_gateway_regions()
 
 # Latest list: https://docs.aws.amazon.com/general/latest/gr/rande.html#lambda_region
-LAMBDA_REGIONS = ['us-east-1', 'us-east-2',
-                  'us-west-1', 'us-west-2',
-                  'eu-central-1',
-                  'eu-north-1',
-                  'eu-west-1', 'eu-west-2', 'eu-west-3',
-                  'eu-north-1',
-                  'ap-northeast-1', 'ap-northeast-2', 'ap-northeast-3',
-                  'ap-southeast-1', 'ap-southeast-2',
-                  'ap-east-1',
-                  'ap-south-1',
-                  'ca-central-1',
-                  'cn-north-1',
-                  'cn-northwest-1',
-                  'sa-east-1',
-                  'us-gov-east-1',
-                  'us-gov-west-1']
+LAMBDA_REGIONS = get_lambda_regions()
 
 # We never need to include these.
 # Related: https://github.com/Miserlou/Zappa/pull/56
 # Related: https://github.com/Miserlou/Zappa/pull/581
-ZIP_EXCLUDES = [
-    '*.exe', '*.DS_Store', '*.Python', '*.git', '.git/*', '*.zip', '*.tar.gz',
-    '*.hg', 'pip', 'docutils*', 'setuputils*', '__pycache__/*'
-]
+ZIP_EXCLUDES = get_zip_excludes()
 
 # When using ALB as an event source for Lambdas, we need to create an alias
 # to ensure that, on zappa update, the ALB doesn't lose permissions to access
@@ -549,7 +634,7 @@ class Zappa:
             # Slim handler does not take the project files.
             if minify:
                 # Related: https://github.com/Miserlou/Zappa/issues/744
-                excludes = ZIP_EXCLUDES + exclude + [split_venv[-1]]
+                excludes = get_zip_excludes() + exclude + [split_venv[-1]]
                 copytree(cwd, temp_project_path, metadata=False, symlinks=False, ignore=shutil.ignore_patterns(*excludes))
             else:
                 copytree(cwd, temp_project_path, metadata=False, symlinks=False)
@@ -623,7 +708,7 @@ class Zappa:
         egg_links.extend(glob.glob(os.path.join(site_packages, '*.egg-link')))
 
         if minify:
-            excludes = ZIP_EXCLUDES + exclude
+            excludes = get_zip_excludes() + exclude
             copytree(site_packages, temp_package_path, metadata=False, symlinks=False, ignore=shutil.ignore_patterns(*excludes))
         else:
             copytree(site_packages, temp_package_path, metadata=False, symlinks=False)
@@ -633,7 +718,7 @@ class Zappa:
         if os.path.exists(site_packages_64):
             egg_links.extend(glob.glob(os.path.join(site_packages_64, '*.egg-link')))
             if minify:
-                excludes = ZIP_EXCLUDES + exclude
+                excludes = get_zip_excludes() + exclude
                 copytree(site_packages_64, temp_package_path, metadata = False, symlinks=False, ignore=shutil.ignore_patterns(*excludes))
             else:
                 copytree(site_packages_64, temp_package_path, metadata = False, symlinks=False)
@@ -3209,10 +3294,10 @@ class Zappa:
         # use provided session's region in case it differs
         self.aws_region = self.boto_session.region_name
 
-        if self.boto_session.region_name not in LAMBDA_REGIONS:
+        if self.boto_session.region_name not in get_lambda_regions():
             print("Warning! AWS Lambda may not be available in this AWS Region!")
 
-        if self.boto_session.region_name not in API_GATEWAY_REGIONS:
+        if self.boto_session.region_name not in get_api_gateway_regions():
             print("Warning! AWS API Gateway may not be available in this AWS Region!")
 
     @staticmethod

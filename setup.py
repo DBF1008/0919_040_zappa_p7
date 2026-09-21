@@ -16,7 +16,8 @@ with open(os.path.join(os.path.dirname(__file__), 'test_requirements.in')) as f:
 setup(
     name='zappa',
     version=__version__,
-    packages=['zappa'],
+    packages=['zappa', 'zappa.data'],
+    package_data={'zappa': ['data/aws_regions.json']},
     install_requires=required,
     tests_require=test_required,
     test_suite='nose.collector',

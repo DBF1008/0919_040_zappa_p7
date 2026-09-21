@@ -1,2 +1,3 @@
 include README.md LICENSE requirements.txt test_requirements.txt requirements.in test_requirements.in
 recursive-include zappa *.py
+include zappa/data/aws_regions.json

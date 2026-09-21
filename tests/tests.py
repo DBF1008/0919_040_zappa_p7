@@ -21,7 +21,9 @@ from click.globals import resolve_color_default
 from click.exceptions import ClickException
 
 from zappa.cli import ZappaCLI, shamelessly_promote, disable_click_colors
-from zappa.core import ALB_LAMBDA_ALIAS
+from zappa.core import (ALB_LAMBDA_ALIAS, API_GATEWAY_REGIONS, LAMBDA_REGIONS,
+                        ZIP_EXCLUDES, get_api_gateway_regions,
+                        get_lambda_regions, get_zip_excludes)
 from zappa.ext.django_zappa import get_django_wsgi
 from zappa.letsencrypt import get_cert_and_update_domain, create_domain_key, create_domain_csr, \
     create_chained_certificate, cleanup, parse_account_key, parse_csr, sign_certificate, encode_certificate,\
@@ -1089,6 +1091,152 @@ class TestZappa(unittest.TestCase):
         zappa_cli = ZappaCLI()
         zappa_cli.api_stage = 'ttt888'
         self.assertRaises(ValueError, zappa_cli.load_settings, 'tests/test_bad_environment_vars.json')
+
+    def test_stage_config_is_cached(self):
+        """
+        Accessing stage_config repeatedly during a deploy must not re-resolve
+        the ``extends`` chain every time.
+        """
+        zappa_cli = ZappaCLI()
+        zappa_cli.zappa_settings = {
+            'base': {'s3_bucket': 'lmbda'},
+            'child': {'extends': 'base', 's3_bucket': 'child-bucket'},
+        }
+        zappa_cli.api_stage = 'child'
+
+        resolve_calls = []
+        original_resolve = zappa_cli._resolve_stage_settings
+
+        def counting_resolve(stage, extended_stages=None):
+            resolve_calls.append(stage)
+            return original_resolve(stage, extended_stages)
+
+        zappa_cli._resolve_stage_settings = counting_resolve
+        for _ in range(12):
+            config = zappa_cli.stage_config
+            self.assertEqual('child-bucket', config['s3_bucket'])
+
+        # The chain (child + parent base) is resolved once, then served from cache.
+        self.assertEqual(['child', 'base'], resolve_calls)
+
+    def test_stage_config_cache_returns_copy(self):
+        """
+        Mutating a stage_config result must not poison the cached settings.
+        """
+        zappa_cli = ZappaCLI()
+        zappa_cli.zappa_settings = {'dev': {'s3_bucket': 'lmbda'}}
+        zappa_cli.api_stage = 'dev'
+
+        zappa_cli.stage_config['s3_bucket'] = 'poisoned'
+        self.assertEqual('lmbda', zappa_cli.stage_config['s3_bucket'])
+
+    def test_stage_config_cache_invalidated_on_reload(self):
+        """
+        Loading a new settings file must drop the memoized stage settings.
+        """
+        tempdir = tempfile.mkdtemp(prefix="zappa-test-settings")
+        settings_path = os.path.join(tempdir, "zappa_settings.json")
+        try:
+            with open(settings_path, 'w') as f:
+                json.dump({'dev': {'s3_bucket': 'first'}}, f)
+
+            zappa_cli = ZappaCLI()
+            zappa_cli.load_settings_file(settings_path)
+            zappa_cli.api_stage = 'dev'
+            self.assertEqual('first', zappa_cli.stage_config['s3_bucket'])
+
+            with open(settings_path, 'w') as f:
+                json.dump({'dev': {'s3_bucket': 'second'}}, f)
+            zappa_cli.load_settings_file(settings_path)
+            self.assertEqual('second', zappa_cli.stage_config['s3_bucket'])
+        finally:
+            shutil.rmtree(tempdir)
+
+    def test_extended_settings_cache_circular_detection(self):
+        """
+        Circular extends are still detected with the cached resolver.
+        """
+        zappa_cli = ZappaCLI()
+        zappa_cli.zappa_settings = {
+            'a': {'extends': 'b'},
+            'b': {'extends': 'a'},
+        }
+        zappa_cli.api_stage = 'a'
+        with self.assertRaises(RuntimeError):
+            zappa_cli.stage_config
+
+    def test_parser_builders_cover_all_subcommands(self):
+        """
+        Every registered subcommand has an argparse builder, and the parser
+        exposes it.
+        """
+        from zappa import cli as cli_module
+
+        zappa_cli = ZappaCLI()
+        parser = zappa_cli._create_parser()
+        help_text = parser.format_help()
+
+        for command, help_description in cli_module.SUBCOMMANDS:
+            self.assertTrue(hasattr(zappa_cli, '_add_' + command + '_parser'))
+            self.assertIn(command, help_text)
+            if command != 'init':
+                self.assertTrue(hasattr(zappa_cli, '_run_' + command))
+
+    def test_parser_parses_common_subcommand_arguments(self):
+        """
+        The split-out parsers produce the same arguments as the old
+        monolithic parser.
+        """
+        zappa_cli = ZappaCLI()
+        parser = zappa_cli._create_parser()
+
+        args = vars(parser.parse_args(['deploy', 'ttt888', '-z', 'pkg.zip']))
+        self.assertEqual('deploy', args['command'])
+        self.assertEqual('ttt888', args['stage_env'])
+        self.assertEqual('pkg.zip', args['zip'])
+
+        args = vars(parser.parse_args(['rollback', 'dev', '-n', '2']))
+        self.assertEqual(2, args['num_rollback'])
+
+        with self.assertRaises(SystemExit):
+            parser.parse_args(['rollback', 'dev', '-n', '-1'])
+
+    def test_resolve_stage_env_manage_special_case(self):
+        """
+        ``manage`` splits the stage out of command_rest (argparse can't).
+        """
+        zappa_cli = ZappaCLI()
+        zappa_cli.command = 'manage'
+        zappa_cli.vargs = {
+            'all': False,
+            'command_rest': ['dev', 'showmigrations', 'admin'],
+        }
+        zappa_cli._resolve_stage_env()
+        self.assertEqual('dev', zappa_cli.stage_env)
+        self.assertEqual(['showmigrations', 'admin'], zappa_cli.vargs['command_rest'])
+
+    def test_dynamic_regions_and_zip_excludes(self):
+        """
+        The externalized constants are lists, include known values, and honor
+        environment variable overrides.
+        """
+        from zappa import core
+
+        self.assertIn('us-east-1', get_api_gateway_regions())
+        self.assertIn('us-east-1', get_lambda_regions())
+        self.assertIn('*.git', get_zip_excludes())
+
+        # Backwards compatible constant names remain available.
+        self.assertIsInstance(API_GATEWAY_REGIONS, list)
+        self.assertIsInstance(LAMBDA_REGIONS, list)
+        self.assertIsInstance(ZIP_EXCLUDES, list)
+
+        # Environment overrides take precedence and are cached, then reset.
+        core._runtime_constants_cache.clear()
+        with mock.patch.dict(os.environ, {'ZAPPA_LAMBDA_REGIONS': 'custom-1, custom-2'}):
+            self.assertEqual(['custom-1', 'custom-2'], get_lambda_regions())
+        core._runtime_constants_cache.clear()
+        self.assertIn('us-east-1', get_lambda_regions())
 
     # @mock.patch('botocore.session.Session.full_config', new_callable=mock.PropertyMock)
     # def test_cli_init(self, mock_config):
